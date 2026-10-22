@@ -21,6 +21,11 @@ from .config import N_SUBCARRIERS, WINDOW_SIZE, WINDOW_STEP
 from .preprocessing import load_amplitude_series
 
 
+# 手工特征的版本号：每次增删/改名特征都要 +1。dataset 的缓存 meta 会校验它，
+# 防止"特征定义变了但旧 npz 缓存被静默复用"（列含义错位，训练不会报错只会变蠢）。
+FEATURE_VERSION = 2   # v1: 29×2=58 维；v2: +6×2 窗内时序结构特征 -> 35×2=70 维
+
+
 def _moments(x: np.ndarray) -> tuple[float, float]:
     """x 的 (偏度, 超额峭度) —— 用中心矩计算，不依赖 scipy。"""
     n = x.size
@@ -137,6 +142,35 @@ def _feature_vector(A: np.ndarray, fs: float, prefix: str):
     names += [f"{prefix}_ac1", f"{prefix}_ac2", f"{prefix}_ac3"]
     vals += [float(ac[0]), float(ac[1]), float(ac[2])]
 
+    # ---- 窗内时序结构（v2 新增，6 维） ---------------------------------------
+    # 动机：跌倒的本质是"运动→骤停"的**转换**，而上面的统计量都是全窗平均，
+    # 把转换抹平了——全程静止的 stand 窗和跌倒文件里冲击前/后的静止窗在
+    # 那 29 维上几乎同分布（误报归因的主因）。这里把窗切成 K 段看活动度
+    # 序列的**形状**：有没有骤降、骤降在哪、末尾是否安静。
+    # stand: 各段活动度都低且平 -> drop≈0、tail≈0、位置随机
+    # fall 冲击窗: 峰后骤降 -> max_drop 大、tail_ratio 很负
+    # walk/jump: 各段持续高 -> drop≈0、tail≈0（靠 diff_mean 与 stand 区分）
+    K = 8
+    if diff_seq.size >= K:
+        # array_split 兼容不整除（diff 后长度是 T-1）
+        seg_act = np.array([s.mean() for s in np.array_split(diff_seq, K)])
+    else:                                                      # 窗太短的兜底
+        seg_act = np.full(K, float(diff_seq.mean()) if diff_seq.size else 0.0)
+    eps_a = 1e-6
+    la = np.log(seg_act + eps_a)                               # log 域，抗增益
+    half = K // 2
+    early_late = float(la[:half].mean() - la[half:].mean())
+    d_seg = np.diff(la)                                        # (K-1,) 相邻段跳变
+    max_drop = float(-d_seg.min())                             # 最大骤降幅度(正=骤降)
+    drop_pos = float(int(np.argmin(d_seg)) + 1) / K            # 骤降位置(归一化)
+    max_rise = float(d_seg.max())                              # 最大上升幅度
+    peak_pos = float(int(np.argmax(seg_act))) / (K - 1)        # 活动峰位置
+    tail = float(la[-2:].mean() - la.mean())                   # 末尾相对安静度
+    names += [f"{prefix}_act_early_late", f"{prefix}_act_max_drop",
+              f"{prefix}_act_drop_pos", f"{prefix}_act_max_rise",
+              f"{prefix}_act_peak_pos", f"{prefix}_act_tail_quiet"]
+    vals += [early_late, max_drop, drop_pos, max_rise, peak_pos, tail]
+
     # ---- 频域特征 -----------------------------------------------------------
     cent = _spectral_features(resid, fs)
     names += [f"{prefix}_f_centroid", f"{prefix}_f_spread", f"{prefix}_f_dom",
@@ -150,7 +184,7 @@ def _feature_vector(A: np.ndarray, fs: float, prefix: str):
 
 # 每个活动文件的可重复特征名
 def feature_names() -> list[str]:
-    """返回最终特征顺序。raw/rel 两组各 29 个（合计 58）。"""
+    """返回最终特征顺序。raw/rel 两组各 35 个（合计 70）。"""
     dummy = np.zeros((WINDOW_SIZE, N_SUBCARRIERS), dtype=np.float32) + 10.0
     _, n1 = _feature_vector(dummy + np.random.randn(*dummy.shape) * 0.01, 83.0, "raw")
     _, n2 = _feature_vector(dummy + np.random.randn(*dummy.shape) * 0.01, 83.0, "rel")
@@ -210,7 +244,7 @@ def window_feature_vector(
         amp_win:   (W, S) 幅度窗
         baseline_s:(S,)  每子载波参考基线，用于相对幅度归一化;
                      None 时用本窗中位数近似（流式降级策略）
-    返回长度为 2*33 的特征向量。
+    返回长度为 2*35=70 的特征向量（raw/rel 两组各 35 个）。
     """
     if baseline_s is None:
         baseline_s = np.median(amp_win, axis=0)

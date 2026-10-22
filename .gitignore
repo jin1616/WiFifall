@@ -14,7 +14,10 @@ env/
 ENV/
 
 # ---- 原始 CSI 数据 (体积约 137MB，需另行获取) ----
-ID[0-9]/
+DATA/ID[0-9]/
+
+# ---- 自采数据 realdata/ (~190MB，含 404 条人声录音 .wav，隐私+体积原因不入库) ----
+realdata/
 
 # ---- 生成结果 (运行 run_train.py 等可重新生成) ----
 outputs/

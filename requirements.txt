@@ -3,3 +3,14 @@ pandas>=1.5
 matplotlib>=3.6
 scikit-learn>=1.2
 joblib>=1.2
+
+# ---- 深度学习（MLP / DLSmall / CNN1D 三个模型都是 PyTorch 写的，必须装）----
+# CPU 版够用，实测环境是 torch 2.6.0。要 CUDA 版去 https://pytorch.org/get-started/locally/ 换源
+torch>=2.0
+
+# ---- 硬件相关：只有要接 ESP32-S3 才需要 ----
+pyserial>=3.5          # 串口读 CSI 帧（csi_probe_serial / csi_serial_to_csv / csi_collect_labeled）
+# sounddevice>=0.5     # 可选：CSI + 麦克风同步采集（tools/csi_audio_sync.py）
+#                      #   pip install -i https://mirrors.aliyun.com/pypi/simple/ sounddevice）
+# esptool>=4.5         # 烧预编译固件用（见 firmware/prebuilt/），只在烧板子时装：
+#                      #   pip install -i https://mirrors.aliyun.com/pypi/simple/ esptool

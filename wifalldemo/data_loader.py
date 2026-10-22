@@ -1,20 +1,52 @@
-"""数据加载：扫描 IDxx/<activity>/*.csv 并构造成样本清单(DataFrame)。
+"""数据加载：扫描数据源并构造成样本清单(DataFrame)。
 
-Widar3.0 风格的目录布局（此处为按"人/动作"整理的切片版本）：
-    <data_root>/ID0/fall/2023-11-12_21-21-03-546_104_1.csv
-    <data_root>/ID0/walk/2023-11-12_21-16-58-889_104_1.csv
-    ...
-每个 CSV = 一个连续动作片段，含逐包 CSI（行）。
+支持的两种数据源 (按 ``scan_dataset`` 的入参自动派发)：
+
+1. **目录**：包含 ``ID*/<activity>/*.csv`` 的文件夹 —— 旧用法，递归扫描原始 CSI。
+2. **pickle**：``run_build_sequence.py`` 生成的 ``data_sequence.pkl``，推荐用法；
+   单次读盘一次到位，下游统一通过 ``<pkl_path>::<sample_idx>`` 编码的 path
+   字段引用样本，由 ``preprocessing.load_sample_amplitude`` /
+   ``dataset._process_one`` 自动识别并取数据。
+
+返回的 DataFrame 始终保持相同 schema::
+
+    user        人员名 (如 "ID0")
+    activity    活动名小写 (如 "fall")
+    label       0/1 (1=跌倒, 0=非跌倒)
+    path        对原始 CSV 是绝对路径；对 pickle 是 ``<pkl_abs>::<idx>`` 编码
 """
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
-
-import pandas as pd
 
 import numpy as np
 
-from .config import DATA_DIR, NEGATIVE_ACTIVITIES, POSITIVE_ACTIVITIES, USER_PREFIX
+import pandas as pd
+
+from .config import DATA_DIR, NEGATIVE_ACTIVITIES, OUTPUT_DIR, POSITIVE_ACTIVITIES, USER_PREFIX
+
+
+# 默认 pickle 路径：与 run_build_sequence.py 的 --output 默认值保持一致
+DEFAULT_PICKLE = OUTPUT_DIR / "data_sequence.pkl"
+
+# 采样目录里和 CSI 样本并排放着的非 CSI 文件，扫描时必须跳过。
+# 采集工具（csi_audio_sync）每条样本会产出四件套，其中 *_audio_env.csv 是逐行声音
+# 能量包络（t_pc, csi_row, rms, dbfs），不是 52 路 CSI。不跳过的话它会被当成一条
+# 正常样本吃进训练集——列数对不上，特征全是脏数，而且样本量凭空翻倍。
+NON_CSI_SUFFIXES = ("_audio_env.csv",)
+
+
+def _is_csi_sample(path: Path) -> bool:
+    """判断一个 CSV 是不是 CSI 样本（排除音频包络等附属文件）。
+
+    除 ``NON_CSI_SUFFIXES`` 外，``_`` 前缀的文件（如摆位探测 ``_probe.csv``）
+    也不参与训练——采集包那边的体检脚本同样按这个约定跳过。
+    """
+    name = path.name.lower()
+    if name.startswith("_"):
+        return False
+    return not any(name.endswith(s) for s in NON_CSI_SUFFIXES)
 
 
 def _label_of(activity: str) -> int:
@@ -22,13 +54,10 @@ def _label_of(activity: str) -> int:
     return 1 if activity in POSITIVE_ACTIVITIES else 0
 
 
-def scan_dataset(data_dir: Path | str = DATA_DIR) -> pd.DataFrame:
-    """递归扫描数据集，返回每条样本文件的一行记录。
-
-    列: user(人员ID), activity(活动名), label(0/1), path(样本绝对路径)
-    """
+def _scan_csv_directory(data_dir: Path | str) -> pd.DataFrame:
+    """递归扫描 ``IDxx/<activity>/*.csv``，返回每条样本文件的一行记录。"""
     data_dir = Path(data_dir)
-    rows = []
+    rows: list[dict] = []
     if not data_dir.exists():
         raise FileNotFoundError(f"数据目录不存在: {data_dir}")
 
@@ -42,12 +71,14 @@ def scan_dataset(data_dir: Path | str = DATA_DIR) -> pd.DataFrame:
             if activity not in POSITIVE_ACTIVITIES | NEGATIVE_ACTIVITIES:
                 continue  # 忽略未知活动目录
             for csv_file in sorted(act_dir.glob("*.csv")):
+                if not _is_csi_sample(csv_file):
+                    continue  # 跳过 *_audio_env.csv 等非 CSI 附属文件
                 rows.append(
                     {
                         "user": user_dir.name,
                         "activity": activity,
                         "label": _label_of(activity),
-                        "path": str(csv_file),
+                        "path": str(csv_file.resolve()),
                     }
                 )
 
@@ -58,6 +89,97 @@ def scan_dataset(data_dir: Path | str = DATA_DIR) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=["user", "activity", "label", "path"])
     return df
+
+
+# 兜底：当 pickle 没存 action_name/user_name 时，按 process1 的字典序回填。
+# 注意 Windows 的 Path 比较是大小写不敏感的，给出 ('fall','Jump',...)，而
+# Linux/macOS 是大小写敏感 ('Jump','fall',...)；这里用 str.lower 做大小写不敏感
+# 排序，保证 fallback 在两个平台上结果一致。
+_ACTION_FALLBACK_BY_ID = tuple(
+    sorted(("fall", "Jump", "sit", "stand", "walk"), key=str.lower)
+)
+
+
+def _resolve_user_name(item: dict, people_id: int) -> str:
+    name = item.get("user_name")
+    if isinstance(name, str) and name:
+        return name
+    return f"ID{people_id}"
+
+
+def _resolve_action_name(item: dict, action_id: int) -> str:
+    name = item.get("action_name")
+    if isinstance(name, str) and name:
+        return name
+    if 0 <= action_id < len(_ACTION_FALLBACK_BY_ID):
+        return _ACTION_FALLBACK_BY_ID[action_id]
+    return f"action_{action_id}"
+
+
+def scan_pickle(pkl_path: str | Path) -> pd.DataFrame:
+    """从 ``data_sequence.pkl`` 加载样本清单 (推荐用法)。
+
+    路径编码 ``<abs_pkl>::<idx>`` 由 ``preprocessing.load_sample_amplitude``
+    通过 ``rpartition('::')`` 解析；这里用绝对路径避免 ``::`` 出现在
+    pkl 路径中导致歧义 (双冒号不会出现在合法文件系统路径里)。
+    """
+    pkl_path = Path(pkl_path)
+    if not pkl_path.exists():
+        raise FileNotFoundError(f"pickle 数据文件不存在: {pkl_path}")
+    abs_pkl = str(pkl_path.resolve())
+
+    with pkl_path.open("rb") as f:
+        seq = pickle.load(f)
+    if not isinstance(seq, list) or not seq:
+        raise ValueError(f"{pkl_path} 内容不是非空 list，无法解析样本")
+
+    rows: list[dict] = []
+    for idx, item in enumerate(seq):
+        user = _resolve_user_name(item, int(item.get("people", 0)))
+        activity = _resolve_action_name(item, int(item.get("action", 0))).lower()
+        rows.append(
+            {
+                "user": user,
+                "activity": activity,
+                "label": _label_of(activity),
+                "path": f"{abs_pkl}::{idx}",
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=["user", "activity", "label", "path"])
+    if df.empty:
+        raise FileNotFoundError(f"在 {pkl_path} 中未解析到任何样本")
+    return df
+
+
+def scan_dataset(source: str | Path | None = None) -> pd.DataFrame:
+    """扫描数据集并返回样本清单 DataFrame (与旧版签名兼容)。
+
+    入参 ``source`` 行为：
+      * ``None``（默认）: 优先尝试 ``outputs/data_sequence.pkl`` (推荐新流程)；
+        若不存在则退回到 ``DATA_DIR`` 下的 CSV 目录扫描。
+      * 目录路径: 走原始 CSV 扫描。
+      * ``.pkl`` 文件路径: 走 pickle 加载。
+
+    下游统一以 ``path`` 列引用样本：CSV 走文件路径，pickle 走
+    ``<abs_pkl>::<idx>`` 编码，二者都由 ``preprocessing.load_sample_amplitude``
+    透明分发。
+    """
+    if source is None:
+        candidate = DEFAULT_PICKLE if DEFAULT_PICKLE.exists() else DATA_DIR
+    else:
+        candidate = Path(source)
+
+    if candidate.is_dir():
+        return _scan_csv_directory(candidate)
+    if candidate.is_file() and candidate.suffix == ".pkl":
+        return scan_pickle(candidate)
+
+    # 显式给定的目录/pickle 都不存在 —— 给出有意义的报错
+    raise FileNotFoundError(
+        f"数据源不存在或类型不支持: {candidate} "
+        f"(期望目录或 .pkl 文件；可先运行 run_build_sequence.py 生成 pickle)"
+    )
 
 
 def balanced_file_index(df: pd.DataFrame) -> np.ndarray:

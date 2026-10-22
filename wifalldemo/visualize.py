@@ -205,3 +205,71 @@ def plot_model_compare(labels: list[str], accs: list[float], name: str = "model_
     ax.set_title("Classifier comparison")
     fig.tight_layout()
     return save_fig(fig, name)
+
+
+def plot_audio_example(
+    track,
+    name: str = "audio_example.png",
+    title: str = "Audio waveform / envelope / spectrogram",
+    mark_impact: bool = True,
+) -> Path:
+    """画一条样本的音频三视图：波形、dB 包络、语谱图。
+
+    ``track`` 是 :class:`wifalldemo.audio.AudioTrack`。竖线标出 CSI 覆盖的时间段
+    （音频比 CSI 长，两头是采集时的余量），三角标出该段内最响的一帧 —— 也就是
+    跌倒落地的那声"砰"。这张图是"声音里到底有没有跌倒证据"最直观的证据。
+    """
+    import matplotlib.pyplot as plt
+
+    x = np.asarray(track.samples, dtype=np.float32)
+    fs = int(track.fs)
+    t = np.arange(x.size, dtype=np.float32) / fs
+    s0, s1 = track.sample_span(0, max(int(round(track.sync.get("csi_rows", 0) or 0)), 1))
+    csi_t0, csi_t1 = s0 / fs, s1 / fs
+
+    fr = track.frames()
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11, 7.2), sharex=True,
+        gridspec_kw={"height_ratios": [1.1, 1.1, 2.0]},
+    )
+
+    axes[0].plot(t, x, lw=0.35, color="tab:blue")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].set_title(title)
+
+    axes[1].plot(fr.t_center, fr.db, lw=0.8, color="tab:orange")
+    axes[1].set_ylabel("Level (dBFS)")
+
+    # 语谱图：32 ms 帧 / 8 ms 跳
+    n, hop = 512, 128
+    if x.size >= n:
+        frames = np.lib.stride_tricks.sliding_window_view(x, n)[::hop]
+        w = np.hanning(n).astype(np.float32)
+        mag = np.abs(np.fft.rfft(frames * w, axis=1)) + 1e-8
+        db = 20.0 * np.log10(mag / mag.max(axis=1, keepdims=True) + 1e-8)
+        db = np.clip(db, -70.0, 0.0)
+        tg = (np.arange(frames.shape[0]) * hop + n / 2) / fs
+        im = axes[2].imshow(
+            db.T, aspect="auto", origin="lower", cmap="magma",
+            extent=[float(tg[0]), float(tg[-1]), 0.0, fs / 2000.0],
+        )
+        fig.colorbar(im, ax=axes[2], pad=0.01, label="dB")
+    axes[2].set_ylabel("Frequency (kHz)")
+    axes[2].set_xlabel("Time (s)")
+
+    for ax in axes:
+        ax.axvspan(csi_t0, csi_t1, color="tab:green", alpha=0.06)
+        ax.axvline(csi_t0, color="tab:green", lw=0.8, ls="--")
+        ax.axvline(csi_t1, color="tab:green", lw=0.8, ls="--")
+
+    if mark_impact and fr.db.size:
+        m = (fr.t_center >= csi_t0) & (fr.t_center < csi_t1)
+        if m.any():
+            idx = np.where(m)[0]
+            peak = int(idx[np.argmax(fr.db[idx])])
+            axes[1].plot(fr.t_center[peak], fr.db[peak], marker="v",
+                         color="tab:red", ms=8, label="strongest frame (in CSI span)")
+            axes[1].legend(loc="lower right", fontsize=8)
+
+    fig.tight_layout()
+    return save_fig(fig, name)
